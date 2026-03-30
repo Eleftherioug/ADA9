@@ -1,6 +1,6 @@
 const express = require('express');
-const session = require('express-session');
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const { db, User, Project, Task } = require('./database/setup');
 require('dotenv').config();
 
@@ -10,34 +10,47 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(express.json());
 
-// Session middleware (TODO: Replace with JWT)
-app.use(session({
-    secret: process.env.SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    cookie: { 
-        secure: false,
-        maxAge: 24 * 60 * 60 * 1000 // 24 hours
-    }
-}));
-
-// TODO: Create JWT middleware to replace session auth
+/* =========================
+   JWT AUTH MIDDLEWARE
+========================= */
 function requireAuth(req, res, next) {
-    if (req.session && req.session.userId) {
-        req.user = {
-            id: req.session.userId,
-            name: req.session.userName,
-            email: req.session.userEmail
-        };
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader) {
+        return res.status(401).json({ error: 'No token provided' });
+    }
+
+    const token = authHeader.split(' ')[1];
+
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        req.user = decoded;
         next();
-    } else {
-        res.status(401).json({ 
-            error: 'Authentication required. Please log in.' 
-        });
+    } catch (err) {
+        return res.status(401).json({ error: 'Invalid token' });
     }
 }
 
-// Test database connection
+/* =========================
+   ROLE MIDDLEWARE
+========================= */
+function requireManager(req, res, next) {
+    if (req.user.role === 'manager' || req.user.role === 'admin') {
+        return next();
+    }
+    return res.status(403).json({ error: 'Manager access required' });
+}
+
+function requireAdmin(req, res, next) {
+    if (req.user.role === 'admin') {
+        return next();
+    }
+    return res.status(403).json({ error: 'Admin access required' });
+}
+
+/* =========================
+   DB CONNECTION
+========================= */
 async function testConnection() {
     try {
         await db.authenticate();
@@ -49,324 +62,198 @@ async function testConnection() {
 
 testConnection();
 
-// AUTHENTICATION ROUTES
+/* =========================
+   AUTH ROUTES
+========================= */
 
-// POST /api/register - Register new user
+// REGISTER
 app.post('/api/register', async (req, res) => {
     try {
-        const { name, email, password } = req.body;
-        
-        // Check if user exists
+        const { name, email, password, role } = req.body;
+
         const existingUser = await User.findOne({ where: { email } });
         if (existingUser) {
-            return res.status(400).json({ error: 'User with this email already exists' });
+            return res.status(400).json({ error: 'User already exists' });
         }
-        
-        // Hash password
+
         const hashedPassword = await bcrypt.hash(password, 10);
-        
-        // Create user
+
         const newUser = await User.create({
             name,
             email,
-            password: hashedPassword
-            // TODO: Add role field
+            password: hashedPassword,
+            role: role || 'employee'
         });
-        
+
         res.status(201).json({
             message: 'User registered successfully',
-            user: {
-                id: newUser.id,
-                name: newUser.name,
-                email: newUser.email
-            }
+            user: newUser
         });
-        
+
     } catch (error) {
-        console.error('Error registering user:', error);
-        res.status(500).json({ error: 'Failed to register user' });
+        console.error(error);
+        res.status(500).json({ error: 'Registration failed' });
     }
 });
 
-// POST /api/login - User login (TODO: Replace with JWT)
+// LOGIN (JWT)
 app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        
+
         const user = await User.findOne({ where: { email } });
+
         if (!user) {
-            return res.status(401).json({ error: 'Invalid email or password' });
+            return res.status(401).json({ error: 'Invalid credentials' });
         }
-        
-        const isValidPassword = await bcrypt.compare(password, user.password);
-        if (!isValidPassword) {
-            return res.status(401).json({ error: 'Invalid email or password' });
+
+        const isValid = await bcrypt.compare(password, user.password);
+
+        if (!isValid) {
+            return res.status(401).json({ error: 'Invalid credentials' });
         }
-        
-        // Create session (TODO: Replace with JWT)
-        req.session.userId = user.id;
-        req.session.userName = user.name;
-        req.session.userEmail = user.email;
-        
+
+        const token = jwt.sign(
+            {
+                id: user.id,
+                email: user.email,
+                name: user.name,
+                role: user.role
+            },
+            process.env.JWT_SECRET,
+            { expiresIn: process.env.JWT_EXPIRES_IN }
+        );
+
         res.json({
             message: 'Login successful',
+            token,
             user: {
                 id: user.id,
                 name: user.name,
-                email: user.email
+                email: user.email,
+                role: user.role
             }
         });
-        
+
     } catch (error) {
-        console.error('Error logging in user:', error);
-        res.status(500).json({ error: 'Failed to login' });
+        console.error(error);
+        res.status(500).json({ error: 'Login failed' });
     }
 });
 
-// POST /api/logout - User logout
+// LOGOUT (JWT → just client discards token)
 app.post('/api/logout', (req, res) => {
-    req.session.destroy((err) => {
-        if (err) {
-            return res.status(500).json({ error: 'Failed to logout' });
-        }
-        res.json({ message: 'Logout successful' });
-    });
+    res.json({ message: 'Logged out (client should delete token)' });
 });
 
-// USER ROUTES
+/* =========================
+   USER ROUTES
+========================= */
 
-// GET /api/users/profile - Get current user profile
+// PROFILE
 app.get('/api/users/profile', requireAuth, async (req, res) => {
     try {
         const user = await User.findByPk(req.user.id, {
-            attributes: ['id', 'name', 'email'] // Don't return password
+            attributes: ['id', 'name', 'email', 'role']
         });
-        
-        if (!user) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-        
+
         res.json(user);
     } catch (error) {
-        console.error('Error fetching user profile:', error);
-        res.status(500).json({ error: 'Failed to fetch user profile' });
+        res.status(500).json({ error: 'Failed to fetch profile' });
     }
 });
 
-// GET /api/users - Get all users (TODO: Admin only)
-app.get('/api/users', requireAuth, async (req, res) => {
+// GET ALL USERS (ADMIN ONLY)
+app.get('/api/users', requireAuth, requireAdmin, async (req, res) => {
     try {
         const users = await User.findAll({
-            attributes: ['id', 'name', 'email'] // Don't return passwords
+            attributes: ['id', 'name', 'email', 'role']
         });
-        
         res.json(users);
     } catch (error) {
-        console.error('Error fetching users:', error);
         res.status(500).json({ error: 'Failed to fetch users' });
     }
 });
 
-// PROJECT ROUTES
+/* =========================
+   PROJECT ROUTES
+========================= */
 
-// GET /api/projects - Get projects
 app.get('/api/projects', requireAuth, async (req, res) => {
-    try {
-        const projects = await Project.findAll({
-            include: [
-                {
-                    model: User,
-                    as: 'manager',
-                    attributes: ['id', 'name', 'email']
-                }
-            ]
-        });
-        
-        res.json(projects);
-    } catch (error) {
-        console.error('Error fetching projects:', error);
-        res.status(500).json({ error: 'Failed to fetch projects' });
-    }
+    const projects = await Project.findAll();
+    res.json(projects);
 });
 
-// GET /api/projects/:id - Get single project
-app.get('/api/projects/:id', requireAuth, async (req, res) => {
+// CREATE PROJECT (MANAGER+)
+app.post('/api/projects', requireAuth, requireManager, async (req, res) => {
     try {
-        const project = await Project.findByPk(req.params.id, {
-            include: [
-                {
-                    model: User,
-                    as: 'manager',
-                    attributes: ['id', 'name', 'email']
-                },
-                {
-                    model: Task,
-                    include: [
-                        {
-                            model: User,
-                            as: 'assignedUser',
-                            attributes: ['id', 'name', 'email']
-                        }
-                    ]
-                }
-            ]
-        });
-        
-        if (!project) {
-            return res.status(404).json({ error: 'Project not found' });
-        }
-        
-        res.json(project);
-    } catch (error) {
-        console.error('Error fetching project:', error);
-        res.status(500).json({ error: 'Failed to fetch project' });
-    }
-});
+        const { name, description } = req.body;
 
-// POST /api/projects - Create new project (TODO: Manager+ only)
-app.post('/api/projects', requireAuth, async (req, res) => {
-    try {
-        const { name, description, status = 'active' } = req.body;
-        
-        const newProject = await Project.create({
+        const project = await Project.create({
             name,
             description,
-            status,
             managerId: req.user.id
         });
-        
-        res.status(201).json(newProject);
+
+        res.status(201).json(project);
     } catch (error) {
-        console.error('Error creating project:', error);
         res.status(500).json({ error: 'Failed to create project' });
     }
 });
 
-// PUT /api/projects/:id - Update project (TODO: Manager+ only)
-app.put('/api/projects/:id', requireAuth, async (req, res) => {
+// UPDATE PROJECT (MANAGER+)
+app.put('/api/projects/:id', requireAuth, requireManager, async (req, res) => {
     try {
-        const { name, description, status } = req.body;
-        
-        const [updatedRowsCount] = await Project.update(
-            { name, description, status },
+        const { name, description } = req.body;
+
+        await Project.update(
+            { name, description },
             { where: { id: req.params.id } }
         );
-        
-        if (updatedRowsCount === 0) {
-            return res.status(404).json({ error: 'Project not found' });
-        }
-        
-        const updatedProject = await Project.findByPk(req.params.id);
-        res.json(updatedProject);
+
+        const updated = await Project.findByPk(req.params.id);
+        res.json(updated);
     } catch (error) {
-        console.error('Error updating project:', error);
         res.status(500).json({ error: 'Failed to update project' });
     }
 });
 
-// DELETE /api/projects/:id - Delete project (TODO: Admin only)
-app.delete('/api/projects/:id', requireAuth, async (req, res) => {
+// DELETE PROJECT (ADMIN ONLY)
+app.delete('/api/projects/:id', requireAuth, requireAdmin, async (req, res) => {
     try {
-        const deletedRowsCount = await Project.destroy({
-            where: { id: req.params.id }
-        });
-        
-        if (deletedRowsCount === 0) {
-            return res.status(404).json({ error: 'Project not found' });
-        }
-        
-        res.json({ message: 'Project deleted successfully' });
+        await Project.destroy({ where: { id: req.params.id } });
+        res.json({ message: 'Project deleted' });
     } catch (error) {
-        console.error('Error deleting project:', error);
         res.status(500).json({ error: 'Failed to delete project' });
     }
 });
 
-// TASK ROUTES
+/* =========================
+   TASK ROUTES
+========================= */
 
-// GET /api/projects/:id/tasks - Get tasks for a project
-app.get('/api/projects/:id/tasks', requireAuth, async (req, res) => {
+// CREATE TASK (MANAGER+)
+app.post('/api/projects/:id/tasks', requireAuth, requireManager, async (req, res) => {
     try {
-        const tasks = await Task.findAll({
-            where: { projectId: req.params.id },
-            include: [
-                {
-                    model: User,
-                    as: 'assignedUser',
-                    attributes: ['id', 'name', 'email']
-                }
-            ]
-        });
-        
-        res.json(tasks);
-    } catch (error) {
-        console.error('Error fetching tasks:', error);
-        res.status(500).json({ error: 'Failed to fetch tasks' });
-    }
-});
+        const { title, description, assignedUserId } = req.body;
 
-// POST /api/projects/:id/tasks - Create task (TODO: Manager+ only)
-app.post('/api/projects/:id/tasks', requireAuth, async (req, res) => {
-    try {
-        const { title, description, assignedUserId, priority = 'medium' } = req.body;
-        
-        const newTask = await Task.create({
+        const task = await Task.create({
             title,
             description,
             projectId: req.params.id,
-            assignedUserId,
-            priority,
-            status: 'pending'
+            assignedUserId
         });
-        
-        res.status(201).json(newTask);
+
+        res.status(201).json(task);
     } catch (error) {
-        console.error('Error creating task:', error);
         res.status(500).json({ error: 'Failed to create task' });
     }
 });
 
-// PUT /api/tasks/:id - Update task
-app.put('/api/tasks/:id', requireAuth, async (req, res) => {
-    try {
-        const { title, description, status, priority } = req.body;
-        
-        const [updatedRowsCount] = await Task.update(
-            { title, description, status, priority },
-            { where: { id: req.params.id } }
-        );
-        
-        if (updatedRowsCount === 0) {
-            return res.status(404).json({ error: 'Task not found' });
-        }
-        
-        const updatedTask = await Task.findByPk(req.params.id);
-        res.json(updatedTask);
-    } catch (error) {
-        console.error('Error updating task:', error);
-        res.status(500).json({ error: 'Failed to update task' });
-    }
-});
+/* =========================
+   START SERVER
+========================= */
 
-// DELETE /api/tasks/:id - Delete task (TODO: Manager+ only)
-app.delete('/api/tasks/:id', requireAuth, async (req, res) => {
-    try {
-        const deletedRowsCount = await Task.destroy({
-            where: { id: req.params.id }
-        });
-        
-        if (deletedRowsCount === 0) {
-            return res.status(404).json({ error: 'Task not found' });
-        }
-        
-        res.json({ message: 'Task deleted successfully' });
-    } catch (error) {
-        console.error('Error deleting task:', error);
-        res.status(500).json({ error: 'Failed to delete task' });
-    }
-});
-
-// Start server
 app.listen(PORT, () => {
-    console.log(`Server running on port http://localhost:${PORT}`);
+    console.log(`Server running at http://localhost:${PORT}`);
 });
